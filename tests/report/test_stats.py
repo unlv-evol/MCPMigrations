@@ -497,3 +497,26 @@ def test_held_out_precision_needs_a_blind_subset_and_an_adjudicated_sheet() -> N
     ):
         tex = to_latex(summarize([], [], label_report=report))
         assert ("\\def\\precHeldOutMigration{0.90}" in tex) is filled
+
+
+def test_the_deferral_wording_is_not_overwritten_by_the_pin_commit_count() -> None:
+    """Two passes code pin wording; the macros must describe the deferring ceilings."""
+    summary = summarize(
+        [],
+        [],
+        qualitative={"pins": {"n": 448, "breakage": 263, "temporary": 1}},
+        measurement={"pin_wording": {"n": 1375, "breakage": 691, "temporary": 5}},
+    )
+    tex = to_latex(summary)
+    assert "\\def\\pctPinBreakage{50.3}" in tex
+    assert "\\def\\nPinTemporary{5}" in tex
+    assert "\\def\\nPinMessages{448}" in tex
+
+
+def test_exact_lower_bound_for_a_perfect_sample() -> None:
+    from mcp_migration.report.stats import clopper_pearson_low
+
+    assert abs(clopper_pearson_low(15, 15) - 0.025 ** (1 / 15)) < 1e-12
+    # Matches the textbook interval for 11 of 14 (0.492).
+    assert abs(clopper_pearson_low(11, 14) - 0.492) < 0.001
+    assert clopper_pearson_low(0, 10) == 0.0

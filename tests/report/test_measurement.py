@@ -121,6 +121,10 @@ def test_ceiling_pairs_read_the_cohorts_pairs_by_keyword() -> None:
         "pin_repair": 1,
         "move_lift": 1,
         "move_dual": 1,
+        "later": 1,
+        "later_lift": 1,
+        "later_dual": 0,
+        "later_rename": 0,
     }
 
 
@@ -359,6 +363,7 @@ def test_responses_count_moves_and_ceilings_from_the_release_state() -> None:
         "deferred_only": 1,
         "both": 0,
         "neither": 0,
+        "neither_active": 0,
     }
     assert out["typescript"] == {"on_v1": 1, "moved": 1}
     assert sorted(out["cohort"]) == ["a/moved", "a/pinned"]
@@ -438,3 +443,137 @@ def test_controls_need_not_be_reused() -> None:
     )
     assert once["matching"]["max_reuse"] <= 1
     assert reused["matching"]["control_entries"] >= once["matching"]["control_entries"]
+
+
+def _commit(
+    day: str, added: dict[str, int], removed: dict[str, int] | None = None, **extra: str
+) -> dict:
+    return {
+        "date": f"2026-{day}T10:00:00+00:00",
+        "sha": day,
+        "added": added,
+        "removed": removed or {},
+        "is_merge": False,
+        "message": day,
+        **extra,
+    }
+
+
+def test_exposure_import_events_and_bots_change_who_and_what_counts() -> None:
+    """The primary keeps exposed repositories; variants change the event and authors."""
+    from mcp_migration.report.measurement import PY_V2_CODE, deferral_from_commits
+
+    fastmcp = {"py_v1_fastmcp_import": 1}
+    other_v1 = {"py_v1_McpError": 1}
+    commits = {
+        # Exposed pin that moves by constraint only, ten days on.
+        "a/exposed": [
+            _commit("01-05", fastmcp),
+            _commit("08-01", {"py_pin_mcp_below_2": 1}),
+            _commit("08-11", {"py_pin_mcp_v2": 1}),
+        ],
+        # A pin in a repository that never used the renamed module.
+        "a/unexposed": [_commit("01-05", other_v1), _commit("08-01", {"py_pin_mcp_below_2": 1})],
+        # A bot adds this one's ceiling.
+        "a/bot": [
+            _commit("01-05", fastmcp),
+            _commit("08-02", {"py_pin_mcp_below_2": 1}, author_kind="bot"),
+        ],
+        # Controls: one exposed, one not; both active before the pins.
+        "c/exposed": [_commit("07-20", fastmcp)],
+        "c/unexposed": [_commit("07-20", other_v1)],
+    }
+    heads = {
+        "a/exposed": {"signals": {**fastmcp, "py_pin_mcp_below_2": 1, "py_pin_mcp_v2": 1}},
+        "a/unexposed": {"signals": {**other_v1, "py_pin_mcp_below_2": 1}},
+        "a/bot": {"signals": {**fastmcp, "py_pin_mcp_below_2": 1}},
+        "c/exposed": {"signals": fastmcp},
+        "c/unexposed": {"signals": other_v1},
+    }
+    run = {"controls_per_pin": 5, "censor_at_own_pin": False}
+    everyone = deferral_from_commits(commits, heads, CENSOR, **run)
+    exposed = deferral_from_commits(commits, heads, CENSOR, exposed_only=True, **run)
+    assert everyone["pinned"]["n"] == 3
+    assert exposed["pinned"]["n"] == 2 and exposed["scopes"]["not_exposed"] == 1
+    # Exposed controls import the renamed module at the matching date.
+    assert exposed["described"]["control_fastmcp"] == exposed["matching"]["control_entries"]
+    # The lifted cap is a constraint event, which the import-only variant ignores.
+    assert exposed["described"]["events_constraint_only"] == 1
+    imports = deferral_from_commits(
+        commits, heads, CENSOR, exposed_only=True, event_keys=PY_V2_CODE, **run
+    )
+    assert imports["pinned"]["events"] == 0
+    no_bots = deferral_from_commits(
+        commits, heads, CENSOR, exposed_only=True, skip_bots=True, **run
+    )
+    assert no_bots["pinned"]["n"] == 1
+    assert exposed["described"]["pin_bot"] == 1
+
+
+def test_a_rewritten_ceiling_is_flagged_as_pre_existing() -> None:
+    from mcp_migration.report.measurement import deferral_from_commits
+
+    pin = {"py_pin_mcp_below_2": 1}
+    commits = {
+        "a/rewrite": [
+            _commit("01-05", {"py_v1_fastmcp_import": 1, **pin}),
+            _commit("08-01", pin, pin),  # the line moves; the count is unchanged
+        ]
+    }
+    heads = {"a/rewrite": {"signals": {"py_v1_fastmcp_import": 1, **pin}}}
+    out = deferral_from_commits(commits, heads, CENSOR)
+    assert out["described"]["pre_existing_ceiling"] == 1
+
+
+def test_ceiling_pairs_count_later_moves_apart() -> None:
+    from mcp_migration.report.measurement import ceiling_pairs
+
+    pairs = [
+        {"gap": 0, "pin_message": "fix", "move_message": "unpin mcp, keep 1.x fallback"},
+        {"gap": 4, "pin_message": "fix", "move_message": "migrate FastMCP -> MCPServer"},
+    ]
+    out = ceiling_pairs(pairs)
+    assert out["move_lift"] == 1 and out["later"] == 1
+    assert out["later_lift"] == 0 and out["later_rename"] == 1
+
+
+def test_landmark_drops_day_zero_events_from_both_groups() -> None:
+    from mcp_migration.report.measurement import deferral_from_commits
+
+    fastmcp = {"py_v1_fastmcp_import": 1}
+    commits = {
+        # Pins and moves on the same day: a day-0 event.
+        "a/fast": [
+            _commit("01-05", fastmcp),
+            {**_commit("08-01", {"py_pin_mcp_below_2": 1}), "date": "2026-08-01T09:00:00+00:00"},
+            _commit("08-01", {"py_v2_mcpserver_import": 1}),
+        ],
+        "a/slow": [_commit("01-05", fastmcp), _commit("08-01", {"py_pin_mcp_below_2": 1})],
+        # A control that moves on the matching day.
+        "c/fast": [_commit("07-20", fastmcp), _commit("08-01", {"py_v2_mcpserver_import": 1})],
+    }
+    heads = {
+        "a/fast": {"signals": {**fastmcp, "py_pin_mcp_below_2": 1, "py_v2_mcpserver_import": 1}},
+        "a/slow": {"signals": {**fastmcp, "py_pin_mcp_below_2": 1}},
+        "c/fast": {"signals": {**fastmcp, "py_v2_mcpserver_import": 1}},
+    }
+    out = deferral_from_commits(
+        commits, heads, CENSOR, controls_per_pin=1, censor_at_own_pin=False, landmark=True
+    )
+    assert out["described"]["landmark_dropped_pinned"] == 1
+    assert out["pinned"]["n"] == 1
+    assert out["described"]["landmark_dropped_controls"] >= 1
+
+
+def test_shared_history_groups_copies_by_common_commits() -> None:
+    from mcp_migration.report.measurement import shared_history
+
+    commits = {
+        "a/orig": [{"sha": "x1", "is_merge": False}, {"sha": "x2", "is_merge": False}],
+        "b/copy": [{"sha": "x2", "is_merge": False}, {"sha": "y1", "is_merge": False}],
+        "c/alone": [{"sha": "z1", "is_merge": False}],
+        "d/merge-only": [{"sha": "x1", "is_merge": True}],
+    }
+    copies, duplicates = shared_history(commits)
+    assert copies == {"groups": 1, "repositories": 2}
+    assert duplicates == {"b/copy"}

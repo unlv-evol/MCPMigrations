@@ -318,13 +318,20 @@ def consensus(
 REPAIR_TRIGGERS = ("user_issue", "bot_pr_breakage", "downstream_change")
 
 
-def coded_profile(rows: Iterable[Mapping[str, str]], kind: str) -> dict[str, Any]:
+def coded_profile(
+    rows: Iterable[Mapping[str, str]], kind: str, since: str | None = None
+) -> dict[str, Any]:
     """What coders found in the sampled episodes of one kind.
 
     Counts only episodes judged genuine, since the other columns are blank for
-    the rest (see docs/codebook.md).
+    the rest (see docs/codebook.md). ``since`` (an ISO date) keeps only episodes
+    starting on or after it.
     """
-    sampled = [r for r in rows if str(r.get("kind", "")) == kind]
+    sampled = [
+        r
+        for r in rows
+        if str(r.get("kind", "")) == kind and (since is None or str(r.get("start", "")) >= since)
+    ]
     genuine = [r for r in sampled if normalize(str(r.get("detector_correct", ""))) == "yes"]
     return {
         "n_sampled": len(sampled),

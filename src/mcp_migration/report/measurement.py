@@ -209,7 +209,10 @@ def deferral(
 
 PY_V2_ADD = ("py_v2_mcpserver_import", "py_pin_mcp_v2")
 PY_V1_KEYS = ("py_v1_fastmcp_import", "py_v1_McpError", "py_v1_streamablehttp_client")
-RISK_DAYS = (0, 10, 20, 30, 40)
+RISK_DAYS = (0, 10, 20, 30, 40, 45)
+# The code-level half of PY_V2_ADD: an import only v2 provides, which a control
+# whose unbounded range reaches v2 at install time must still write.
+PY_V2_CODE = ("py_v2_mcpserver_import",)
 
 
 def deferral_from_commits(
@@ -224,6 +227,12 @@ def deferral_from_commits(
     censor_at_own_pin: bool = True,
     bootstrap: int = 0,
     reuse_controls: bool = True,
+    event_keys: Sequence[str] = PY_V2_ADD,
+    exposed_only: bool = False,
+    skip_bots: bool = False,
+    meta: Mapping[str, Mapping[str, Any]] | None = None,
+    landmark: bool = False,
+    exclude_preexisting: bool = False,
 ) -> dict[str, Any]:
     """Time from a deferring ceiling to Python v2, against date-matched controls.
 
@@ -255,6 +264,25 @@ def deferral_from_commits(
     - ``reuse_controls=False`` draws each control repository at most once
       across all matched sets, visiting pins in random order, as a design check
       on reuse; with one control per pin the pool rarely runs short.
+    - ``event_keys`` are the signals whose addition is the event. Lifting a
+      ceiling rewrites the constraint it bounded, while an unbounded range
+      reaches v2 without a commit, so a constraint event favours the pinned
+      group; ``PY_V2_CODE`` counts only code that v2 alone provides.
+    - ``exposed_only`` restricts both groups to repositories importing
+      ``mcp.server.fastmcp``, the module the release renamed: a pinned
+      repository at its ceiling, a control at the start of the matching day.
+      These are the projects a v2 install would break, so the comparison is
+      between broken projects that did and did not add a ceiling.
+    - ``skip_bots`` ignores bot-authored commits as pinning events and events.
+    - ``landmark`` starts both groups at day 1: entries with an event on
+      their own day 0, pinned or control, are dropped alike. It is the
+      symmetric version of ``drop_same_day``, which removes early events from
+      the pinned group only and so pushes its share down by construction.
+    - ``exclude_preexisting`` drops pinned repositories whose pinning commit
+      rewrote a ceiling that was already there.
+    - ``meta`` (GitHub metadata per repository) adds stars and repository age
+      at the matching date to the balance summary; stars are as collected, not
+      as of the matching date.
 
     ``mcp<2`` is a Python constraint, so both groups are Python repositories.
     """
@@ -278,12 +306,15 @@ def deferral_from_commits(
         )
         rewinders[repo] = Rewinder(ordered[repo], head.get("signals") or {})
 
+    def counts(c: Mapping[str, Any]) -> bool:
+        return not (skip_bots and c.get("author_kind") == "bot")
+
     def first_after(repo: str, moment: str, keys: Sequence[str]) -> Mapping[str, Any] | None:
         return next(
             (
                 c
                 for c in ordered[repo]
-                if str(c["date"]) > moment and any(c["added"].get(k) for k in keys)
+                if str(c["date"]) > moment and counts(c) and any(c["added"].get(k) for k in keys)
             ),
             None,
         )
@@ -293,12 +324,17 @@ def deferral_from_commits(
     pin_dates: list[tuple[str, str]] = []  # (repo, ISO moment)
     pairs: list[dict[str, Any]] = []  # each pinned repository's ceiling and later v2 commit
     pin_messages: list[str] = []  # the ceiling commit's subject, per pinned repository
+    # Descriptive: how pinned events were detected, who authored the commits,
+    # and how many pinned repositories imported the renamed module.
+    described: Counter[str] = Counter()
     for repo, commits in ordered.items():
         pin = next(
             (
                 c
                 for c in commits
-                if c["added"].get("py_pin_mcp_below_2") and RELEASE <= _day(c["date"]) <= censor
+                if c["added"].get("py_pin_mcp_below_2")
+                and RELEASE <= _day(c["date"]) <= censor
+                and counts(c)
             ),
             None,
         )
@@ -306,17 +342,50 @@ def deferral_from_commits(
             continue
         moment = str(pin["date"])
         before = rewinders[repo].counts(moment, inclusive=True)
-        if any(pin["added"].get(k) for k in PY_V2_ADD):
-            scopes["v2_same_commit"] += 1
+        if any(pin["added"].get(k) for k in PY_V2_ADD) or any(
+            before.get(k, 0) > 0 for k in PY_V2_ADD
+        ):
+            scopes[
+                "v2_same_commit"
+                if any(pin["added"].get(k) for k in PY_V2_ADD)
+                else "v2_already_present"
+            ] += 1
+            # Only the first ceiling is classified; count the repositories
+            # whose later ceiling would have been a deferral.
+            described["later_deferral_lost"] += any(
+                c["added"].get("py_pin_mcp_below_2")
+                and str(c["date"]) > moment
+                and _day(c["date"]) <= censor
+                and counts(c)
+                and not any(c["added"].get(k) for k in PY_V2_ADD)
+                and not any(
+                    rewinders[repo].counts(str(c["date"]), inclusive=True).get(k, 0) > 0
+                    for k in PY_V2_ADD
+                )
+                for c in commits
+            )
             continue
-        if any(before.get(k, 0) > 0 for k in PY_V2_ADD):
-            scopes["v2_already_present"] += 1
+        if exposed_only and before.get("py_v1_fastmcp_import", 0) <= 0:
+            scopes["not_exposed"] += 1
             continue
-        move = first_after(repo, moment, PY_V2_ADD)
+        if exclude_preexisting and before.get("py_pin_mcp_below_2", 0) > 0:
+            scopes["pre_existing"] += 1
+            continue
+        move = first_after(repo, moment, event_keys)
         if drop_same_day and move is not None and _day(move["date"]) == _day(moment):
             scopes["same_day_v2"] += 1
             continue
         scopes["deferral"] += 1
+        described["pin_bot"] += pin.get("author_kind") == "bot"
+        # A ceiling already present that this commit only rewrites, moves or
+        # raises the floor of: still counted, reported as a threat.
+        described["pre_existing_ceiling"] += before.get("py_pin_mcp_below_2", 0) > 0
+        described["pinned_fastmcp"] += before.get("py_v1_fastmcp_import", 0) > 0
+        if move is not None and _day(move["date"]) <= censor:
+            code = any(move["added"].get(k) for k in PY_V2_CODE)
+            described["events"] += 1
+            described["events_code" if code else "events_constraint_only"] += 1
+            described["events_bot"] += move.get("author_kind") == "bot"
         pinned.append((_day(moment), _day(move["date"]) if move else None))
         pin_dates.append((repo, moment))
         pin_messages.append(str(pin.get("message", "")))
@@ -353,6 +422,7 @@ def deferral_from_commits(
             for r in pool
             if py_v1(state := rewinders[r].counts(start, inclusive=True))
             and state.get("py_pin_mcp_below_2", 0) == 0
+            and (not exposed_only or state.get("py_v1_fastmcp_import", 0) > 0)
             and (
                 floor is None
                 or any(floor <= str(c["date"])[:10] < day.isoformat() for c in ordered[r])
@@ -364,6 +434,20 @@ def deferral_from_commits(
     switched = short_sets = 0
     prior_pinned: list[int] = []
     prior_controls: list[int] = []
+    balance: dict[str, dict[str, list[float]]] = {
+        "pinned": defaultdict(list),
+        "controls": defaultdict(list),
+    }
+
+    def record(role: str, repo: str, moment: str) -> None:
+        info = (meta or {}).get(repo)
+        if not info:
+            return
+        if info.get("stars") is not None:
+            balance[role]["stars"].append(float(info["stars"]))
+        if info.get("created_at"):
+            age = (_day(moment) - _day(str(info["created_at"]))).days
+            balance[role]["age_days"].append(float(max(0, age)))
 
     def prior_activity(repo: str, moment: str) -> int:
         """Signal commits in the 90 days before the matching date."""
@@ -388,11 +472,17 @@ def deferral_from_commits(
         sample = rng.sample(eligible, min(controls_per_pin, len(eligible)))
         short_sets += len(sample) < controls_per_pin
         prior_pinned.append(prior_activity(pinner, moment))
+        record("pinned", pinner, moment)
         members: list[tuple[date, date | None, date]] = []
         for r in sample:
             chosen[r] += 1
             prior_controls.append(prior_activity(r, moment))
-            move = first_after(r, moment, PY_V2_ADD)
+            record("controls", r, moment)
+            start = f"{_day(moment).isoformat()}T00:00:00+00:00"
+            described["control_fastmcp"] += (
+                rewinders[r].counts(start, inclusive=True).get("py_v1_fastmcp_import", 0) > 0
+            )
+            move = first_after(r, moment, event_keys)
             own_pin = first_after(r, moment, ("py_pin_mcp_below_2",))
             end: date | None = _day(move["date"]) if move else None
             leaves = censor
@@ -421,7 +511,7 @@ def deferral_from_commits(
             for day in RISK_DAYS
         ]
 
-    def median(values: Sequence[int]) -> float | None:
+    def median(values: Sequence[float]) -> float | None:
         ordered_values = sorted(values)
         if not ordered_values:
             return None
@@ -430,10 +520,25 @@ def deferral_from_commits(
             return float(ordered_values[mid])
         return (ordered_values[mid - 1] + ordered_values[mid]) / 2
 
+    if landmark:
+
+        def later(row: Any) -> bool:
+            return not (row[1] is not None and row[1] == row[0])
+
+        described["landmark_dropped_pinned"] = sum(not later(r) for r in pinned)
+        described["landmark_dropped_controls"] = sum(not later(r) for r in controls)
+        pinned = [r for r in pinned if later(r)]
+        controls = [r for r in controls if later(r)]
+        entries = [e for e in entries if later(e[2])]
+        sets = [(p, [m for m in ms if later(m)]) for p, ms in sets if later(p)]
+
+    pinned_km = kaplan_meier(pinned, censor)
+    controls_km = kaplan_meier(controls, censor)
     out: dict[str, Any] = {
         "scopes": dict(scopes),
-        "pinned": kaplan_meier(pinned, censor),
-        "controls": kaplan_meier(controls, censor),
+        "crossing_day": _crossing(pinned, controls, censor),
+        "pinned": pinned_km,
+        "controls": controls_km,
         "risk_pinned": risk_table(pinned),
         "risk_controls": risk_table(controls),
         "controls_per_pin": controls_per_pin,
@@ -446,15 +551,68 @@ def deferral_from_commits(
             "pool": len(pool),
             "prior_signal_commits_median_pinned": median(prior_pinned),
             "prior_signal_commits_median_controls": median(prior_controls),
+            **{
+                f"{key}_median_{role}": median(values)
+                for role, by_key in balance.items()
+                for key, values in by_key.items()
+            },
         },
         "pairs": pairs,
         "pin_messages": pin_messages,
+        "described": dict(described),
     }
     out["pinned_repos"] = [repo for repo, _ in pin_dates]
     if bootstrap and sets:
         out["difference_30"] = _matched_difference(sets, censor, 30, bootstrap, seed)
         out["clustered_30"] = _clustered(entries, censor, 30, bootstrap, seed)
     return out
+
+
+def shared_history(
+    commits_by_repo: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> tuple[dict[str, int], set[str]]:
+    """Copies of one codebase not marked as forks, by commits they share.
+
+    Repositories that share any non-merge commit SHA hold a common history, so
+    they are grouped; all but the first of each group (by name) are returned
+    as duplicates. A stand-in for grouping by root commit, which the harvest
+    did not record, limited to the mined window since 2024-11-01.
+    """
+    parent: dict[str, str] = {}
+
+    def find(repo: str) -> str:
+        while parent.get(repo, repo) != repo:
+            parent[repo] = parent.get(parent[repo], parent[repo])
+            repo = parent[repo]
+        return repo
+
+    owner: dict[str, str] = {}
+    for repo in sorted(commits_by_repo):
+        for commit in commits_by_repo[repo]:
+            if commit.get("is_merge"):
+                continue
+            first = owner.setdefault(str(commit["sha"]), repo)
+            if first != repo:
+                a, b = find(first), find(repo)
+                if a != b:
+                    parent[max(a, b)] = min(a, b)
+    groups: dict[str, list[str]] = defaultdict(list)
+    for repo in commits_by_repo:
+        groups[find(repo)].append(repo)
+    shared = [sorted(g) for g in groups.values() if len(g) > 1]
+    duplicates = {r for g in shared for r in g[1:]}
+    return {"groups": len(shared), "repositories": sum(len(g) for g in shared)}, duplicates
+
+
+def _crossing(pinned: Sequence[Any], controls: Sequence[Any], censor: date) -> int | None:
+    """First day, after day 0, on which the control curve reaches the pinned one."""
+    for day in range(1, 46):
+        a, b = _incidence_at(pinned, censor, day), _incidence_at(controls, censor, day)
+        if a is None or b is None:
+            return None
+        if b >= a:
+            return day
+    return None
 
 
 def _clustered(
@@ -658,6 +816,7 @@ _REPAIR = re.compile(
 )
 _LIFT = re.compile(r"lift|drop\b.*\b(pin|cap)|remove\b.*\b(cap|pin)|unpin", re.I)
 _DUAL = re.compile(r"fallback|alongside|both lines|1\.x and 2\.x|keeps? 1\.x", re.I)
+_RENAME = re.compile(r"fastmcp|mcpserver|rename", re.I)
 
 
 def ceiling_pairs(pairs: Iterable[Mapping[str, Any]]) -> dict[str, int]:
@@ -677,6 +836,13 @@ def ceiling_pairs(pairs: Iterable[Mapping[str, Any]]) -> dict[str, int]:
         out["pin_repair"] += bool(_REPAIR.search(str(pair["pin_message"])))
         out["move_lift"] += bool(_LIFT.search(str(pair["move_message"])))
         out["move_dual"] += bool(_DUAL.search(str(pair["move_message"])))
+        # The same, for moves after the pinning day only: a same-day move is
+        # usually one dual-version change split across two commits.
+        if gap > 0:
+            out["later"] += 1
+            out["later_lift"] += bool(_LIFT.search(str(pair["move_message"])))
+            out["later_dual"] += bool(_DUAL.search(str(pair["move_message"])))
+            out["later_rename"] += bool(_RENAME.search(str(pair["move_message"])))
     return dict(out)
 
 
@@ -730,6 +896,7 @@ def responses(
     commits_by_repo: Mapping[str, Sequence[Mapping[str, Any]]],
     heads: Mapping[str, Mapping[str, Any]],
     repos: set[str] | None = None,
+    censor: date | None = None,
 ) -> dict[str, Any]:
     """Repositories on a v1 SDK at the release, and where they are at harvest.
 
@@ -740,12 +907,17 @@ def responses(
     code and v2 is not already present when it lands. Any ceiling addition is
     counted separately. A TypeScript repository has moved if it uses the split
     v2 packages at HEAD; TypeScript ceilings are not measured.
+
+    Harvests span two weeks, so with ``censor`` the Python rates are also
+    computed as of that day, to show the unequal windows do not matter.
     """
     from mcp_migration.mine.episodes import Rewinder
 
     start = f"{RELEASE.isoformat()}T00:00:00+00:00"
     out: dict[str, Counter[str]] = {"python": Counter(), "typescript": Counter()}
     cohort: list[str] = []
+    ts_cohort: list[str] = []
+    ts_moved: list[str] = []
     for repo, commits in commits_by_repo.items():
         if repos is not None and repo not in repos:
             continue
@@ -787,12 +959,28 @@ def responses(
             row["deferred_only"] += deferred and not moved
             row["both"] += moved and deferred
             row["neither"] += not moved and not deferred
+            # Neither is not inactivity: any signal commit after the release.
+            row["neither_active"] += (
+                not moved and not deferred and any(_day(c["date"]) >= RELEASE for c in ordered)
+            )
+            if censor is not None:
+                end = f"{censor.isoformat()}T23:59:59+00:00"
+                state = rewinder.counts(end, inclusive=False)
+                row["moved_by_censor"] += any(state.get(k, 0) > 0 for k in PY_V2_ADD)
+                row["deferred_by_censor"] += (
+                    deferred and pin is not None and _day(pin["date"]) <= censor
+                )
         if before.get("ts_v1_sdk_pkg", 0) > 0 and before.get("ts_v2_split_pkg", 0) <= 0:
             row = out["typescript"]
             row["on_v1"] += 1
             row["moved"] += head.get("ts_v2_split_pkg", 0) > 0
+            ts_cohort.append(repo)
+            if head.get("ts_v2_split_pkg", 0) > 0:
+                ts_moved.append(repo)
     result: dict[str, Any] = {k: dict(v) for k, v in out.items()}
     result["cohort"] = cohort
+    result["ts_cohort"] = ts_cohort
+    result["ts_moved"] = ts_moved
     return result
 
 
@@ -878,7 +1066,8 @@ def application_dimensions(
     code counts as supporting the revision.
     """
     rows: dict[str, Counter[str]] = defaultdict(Counter)
-    outside_app = 0
+    outside_app = client_only = no_v2 = 0
+    outside: Counter[str] = Counter()
     for repo, scan in scans.items():
         if repos is not None and repo not in repos:
             continue
@@ -887,8 +1076,17 @@ def application_dimensions(
         py = any(app.get(k, 0) > 0 for k in PY_V2_KEYS)
         ts = app.get("ts_v2_server_pkg", 0) > 0
         if not (py or ts):
+            # Every scanned repository falls in exactly one group, so the
+            # populations reconcile with the number scanned.
             if any(every.get(k, 0) > 0 for k in (*PY_V2_KEYS, "ts_v2_server_pkg")):
                 outside_app += 1
+                py_out = any(every.get(k, 0) > 0 for k in PY_V2_KEYS)
+                ts_out = every.get("ts_v2_server_pkg", 0) > 0
+                outside["both" if py_out and ts_out else "python" if py_out else "typescript"] += 1
+            elif app.get("ts_v2_client_pkg", 0) > 0 or every.get("ts_v2_client_pkg", 0) > 0:
+                client_only += 1
+            else:
+                no_v2 += 1
             continue
         language = "both" if py and ts else "python" if py else "typescript"
         row = rows[language]
@@ -897,6 +1095,11 @@ def application_dimensions(
         if language in ("python", "both"):
             row["modern"] += 1
             row["legacy"] += 1
+            # A v2 server class import, rather than only a version constraint
+            # that a client could also declare.
+            server = app.get("py_v2_mcpserver_import", 0) > 0
+            row["server_import"] += server
+            row["server_features"] += server and any(app.get(k, 0) > 0 for k in APP_FEATURE_KEYS)
             continue
         modern = app.get(TS_MODERN_ENTRY, 0) > 0
         v1_style = app.get("ts_v1_transport_class", 0) > 0
@@ -924,7 +1127,12 @@ def application_dimensions(
         row["reject_any"] += reject
         retired = modern and reject and not route and not v1_style
         row["legacy"] += not retired
-    out: dict[str, Any] = {"v2_outside_application_only": outside_app}
+    out: dict[str, Any] = {
+        "v2_outside_application_only": outside_app,
+        "typescript_client_only": client_only,
+        "no_v2_found": no_v2,
+        "outside_by_language": dict(outside),
+    }
     no_entry = rows.pop("typescript_no_entry", None)
     out["typescript_no_entry"] = int(no_entry["n"]) if no_entry else 0
     not_v2 = rows.pop("typescript_not_v2", None)
@@ -938,6 +1146,11 @@ def application_dimensions(
             "pct_features": 100 * row["features"] / n,
             "features": row["features"],
         }
+        if language == "python":
+            entry["server_import"] = row["server_import"]
+            entry["server_features"] = row["server_features"]
+            if row["server_import"]:
+                entry["pct_server_features"] = 100 * row["server_features"] / row["server_import"]
         if language == "typescript":
             entry.update(
                 {
@@ -1005,6 +1218,10 @@ def audit_agreement(
     """
     decisions: Counter[str] = Counter()
     agreed: Counter[str] = Counter()
+    # The classifier's positive calls alone, for the precision of positives:
+    # agreement over all calls mixes in correct negatives.
+    positives: Counter[str] = Counter()
+    positives_agreed: Counter[str] = Counter()
     for repo, label in labels.items():
         scan = scans.get(repo)
         if scan is None:
@@ -1017,13 +1234,24 @@ def audit_agreement(
                 continue
             decisions[field] += 1
             agreed[field] += call[field] == truth
+            if call[field] is True:
+                positives[field] += 1
+                positives_agreed[field] += truth is True
     total = sum(decisions.values())
     return {
         "repos": sum(1 for r in labels if r in scans),
         "decisions": total,
         "agreed": sum(agreed.values()),
         "pct": 100 * sum(agreed.values()) / total if total else None,
-        "by_field": {f: {"n": decisions[f], "agreed": agreed[f]} for f in decisions},
+        "by_field": {
+            f: {
+                "n": decisions[f],
+                "agreed": agreed[f],
+                "positive": positives[f],
+                "positive_agreed": positives_agreed[f],
+            }
+            for f in decisions
+        },
     }
 
 
@@ -1142,6 +1370,7 @@ def load_measurement(paths: Any, censor: date | None, seeds: set[str]) -> dict[s
         )
     }
     everyone = set(heads)
+    copies, duplicates = shared_history(commits_by_repo)
     ts_dir = paths.ts_root
     legacy_audit_file = ts_dir / "legacy-only-audit.json"
     legacy_audit = (
@@ -1150,40 +1379,70 @@ def load_measurement(paths: Any, censor: date | None, seeds: set[str]) -> dict[s
         else None
     )
 
+    meta = (
+        {str(row["repo"]): row for row in read_jsonl(paths.repo_meta)}
+        if paths.repo_meta.exists()
+        else {}
+    )
+
     def deferral(**options: Any) -> dict[str, Any]:
+        """One analysis: by default the primary design, with every option shown."""
         options.setdefault("censor_at_own_pin", False)
-        result = deferral_from_commits(commits_by_repo, heads, censor, **options)
+        options.setdefault("exposed_only", True)
+        options.setdefault("bootstrap", 1000)
+        result = deferral_from_commits(commits_by_repo, heads, censor, meta=meta, **options)
         for key in ("pairs", "pin_messages", "pinned_repos"):
             result.pop(key, None)
         return result
 
     from mcp_migration.report.qualitative import code_pin_messages
 
-    # The comparison is with repositories unpinned on the matching date, so a
-    # control is followed whatever it does later; censoring it at its own
-    # ceiling is the sensitivity analysis.
-    primary = deferral_from_commits(
-        commits_by_repo, heads, censor, bootstrap=1000, censor_at_own_pin=False
+    # Every deferring ceiling, against any v1 repository: what projects wrote
+    # when they deferred, and the pinned repositories that later moved, come
+    # from here, as does the comparison not matched on exposure.
+    all_v1 = deferral_from_commits(
+        commits_by_repo,
+        heads,
+        censor,
+        bootstrap=1000,
+        censor_at_own_pin=False,
+        meta=meta,
     )
-    pairs = primary.pop("pairs", [])
-    pin_messages = primary.pop("pin_messages", [])
-    pinned_repos = set(primary.pop("pinned_repos", []))
-    release = responses(commits_by_repo, heads)
+    pairs = all_v1.pop("pairs", [])
+    pin_messages = all_v1.pop("pin_messages", [])
+    pinned_repos = set(all_v1.pop("pinned_repos", []))
+    # Ceilings mostly repair a break, so the primary comparison is between
+    # exposed repositories, those importing the renamed module, that did and
+    # did not add a ceiling. The comparison is with repositories unpinned on
+    # the matching date, so a control is followed whatever it does later;
+    # censoring it at its own ceiling is a sensitivity analysis.
+    primary = deferral()
+    release = responses(commits_by_repo, heads, censor=censor)
     cohort = set(release.pop("cohort", []))
+    ts_cohort = set(release.pop("ts_cohort", []))
+    ts_moved = set(release.pop("ts_moved", []))
     release_corpus = responses(commits_by_repo, heads, repos=seeds)
-    release_corpus.pop("cohort", None)
+    for key in ("cohort", "ts_cohort", "ts_moved"):
+        release_corpus.pop(key, None)
     return {
         "censor": censor.isoformat(),
         # RQ2 from commits: ceilings classified at their own commit, followed
         # forward, against date-matched controls active in the prior 90 days.
         "deferral": primary,
+        "deferral_all_v1": all_v1,
         "deferral_same_day_excluded": deferral(drop_same_day=True),
         "deferral_unmatched": deferral(active_days=None),
         "deferral_censor_controls": deferral(censor_at_own_pin=True),
         "deferral_no_reuse": deferral(reuse_controls=False, controls_per_pin=1),
+        "deferral_code_only": deferral(event_keys=PY_V2_CODE),
+        "deferral_no_bots": deferral(skip_bots=True),
+        "deferral_landmark": deferral(landmark=True),
+        "deferral_no_preexisting": deferral(exclude_preexisting=True),
+        "deferral_dedup": deferral(repos=everyone - duplicates),
+        "copies": copies,
         "deferral_corpus": deferral(repos=seeds),
-        "deferral_agent": deferral(repos=agent_before & everyone),
-        "deferral_no_agent": deferral(repos=everyone - agent_before),
+        "deferral_agent": deferral(repos=agent_before & everyone, bootstrap=0),
+        "deferral_no_agent": deferral(repos=everyone - agent_before, bootstrap=0),
         "protocol": protocol_dimensions(
             heads, ts_heads, ts_servers=ts_servers, ts_scanned=ts_scanned
         ),
@@ -1193,15 +1452,21 @@ def load_measurement(paths: Any, censor: date | None, seeds: set[str]) -> dict[s
         "pin_wording": {
             "n": len(pin_messages),
             **code_pin_messages(pin_messages),
-            "check": json.loads((ts_dir / "pin-wording-check.json").read_text(encoding="utf-8"))
-            if (ts_dir / "pin-wording-check.json").exists()
-            else {},
+            "check": _wording_check(ts_dir / "pin-wording-check.json", pin_messages),
         },
         "responses": release,
         "responses_corpus": release_corpus,
         "cohort_flow": {
             "pinned": len(pinned_repos),
             "pinned_in_release_cohort": len(pinned_repos & cohort),
+            # How RQ1's TypeScript cohort relates to RQ2's TypeScript servers.
+            "ts_moved_scanned": len(ts_moved & set(app_scans)),
+            "ts_app_not_in_cohort": sum(
+                1
+                for repo, scan in app_scans.items()
+                if (scan.get("app_signals") or {}).get("ts_v2_server_pkg", 0) > 0
+                and repo not in ts_cohort
+            ),
         },
         "issue_themes": issue_themes(paths.qualitative, ts_dir / "issue-relevance.json"),
         "sampling_vignette": _vignette(ts_dir / "sampling-vignette-labels.json"),
@@ -1264,6 +1529,37 @@ def load_measurement(paths: Any, censor: date | None, seeds: set[str]) -> dict[s
         ),
         "n_agent_before": len(agent_before & everyone),
     }
+
+
+def _wording_check(path: Any, pin_messages: Sequence[str]) -> dict[str, Any]:
+    """The manual check of the keyword repair code, with Cohen's kappa.
+
+    The check file records the draw (``random.seed(3)``, 40 of the deferring
+    ceiling subjects) and the subjects where the reading disagreed with the
+    keyword code; redrawing the same sample recovers both codings.
+    """
+    import json
+    import random
+
+    from mcp_migration.report.qualitative import code_pin
+
+    if not path.exists():
+        return {}
+    check = json.loads(path.read_text(encoding="utf-8"))
+    out = dict(check)
+    sample = random.Random(3).sample(list(pin_messages), int(check["n"]))
+    flipped = set(check.get("disagreements") or {})
+    if sum(m in flipped for m in sample) != len(flipped):
+        return out  # a different draw: the kappa would not describe the check
+    keyword = ["breakage" in code_pin(m) for m in sample]
+    manual = [(not k) if m in flipped else k for m, k in zip(sample, keyword, strict=True)]
+    n = len(sample)
+    observed = sum(a == b for a, b in zip(keyword, manual, strict=True)) / n
+    pk, pm = sum(keyword) / n, sum(manual) / n
+    expected = pk * pm + (1 - pk) * (1 - pm)
+    if expected < 1:
+        out["kappa"] = (observed - expected) / (1 - expected)
+    return out
 
 
 def _manual_claims(path: Any, subjects: Sequence[tuple[str, str, bool]]) -> dict[str, int]:

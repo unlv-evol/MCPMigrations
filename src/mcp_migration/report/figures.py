@@ -462,6 +462,11 @@ def technical_lag(profiles: Mapping[str, Mapping[str, Any]], out: Path) -> Path:
     return out
 
 
+def _plotted_n(row: Mapping[str, Any]) -> int:
+    """The denominator of a language's bars: Python servers, else resolved repositories."""
+    return int(row.get("server_import") or row.get("resolved", row["n"]))
+
+
 def protocol_support(protocol: Mapping[str, Mapping[str, Any]], out: Path) -> Path:
     """Share of v2 repositories supporting the new revision, and with a selected
     feature marker detected, grouped by SDK language.
@@ -488,7 +493,11 @@ def protocol_support(protocol: Mapping[str, Mapping[str, Any]], out: Path) -> Pa
         for j, key in enumerate(("pct_modern", "pct_features")):
             for i, lang in enumerate(languages):
                 row = protocol[lang]
-                y = float(row.get(key, row.get(key.replace("pct_", "pct_new_"))) or 0.0)
+                if key == "pct_features" and row.get("pct_server_features") is not None:
+                    key_used = "pct_server_features"  # Python servers, as in TypeScript
+                else:
+                    key_used = key
+                y = float(row.get(key_used, row.get(key.replace("pct_", "pct_new_"))) or 0.0)
                 sdk = key == "pct_modern" and lang in assigned
                 ax.bar(
                     i + (j - 0.5) * width,
@@ -511,10 +520,7 @@ def protocol_support(protocol: Mapping[str, Mapping[str, Any]], out: Path) -> Pa
                 )
         ax.set_xticks(range(len(languages)))
         ax.set_xticklabels(
-            [
-                f"{labels[lang]}\n(n={int(protocol[lang].get('resolved', protocol[lang]['n'])):,})"
-                for lang in languages
-            ]
+            [f"{labels[lang]}\n(n={_plotted_n(protocol[lang]):,})" for lang in languages]
         )
         ax.set_ylim(0, 112)
         ax.set_yticks([0, 25, 50, 75, 100])
@@ -553,6 +559,165 @@ def protocol_support(protocol: Mapping[str, Mapping[str, Any]], out: Path) -> Pa
     return out
 
 
+# Rows of the deferral forest plot: (group heading or None, summary key, label).
+FOREST_ROWS: tuple[tuple[str | None, str, str], ...] = (
+    (None, "deferral", "primary (exposed)"),
+    ("timing", "deferral_landmark", "landmark at day 1 (both groups)"),
+    ("timing", "deferral_same_day_excluded", "drop same-day v2 (pinned only)"),
+    ("event and sample", "deferral_code_only", "import events only"),
+    ("event and sample", "deferral_no_bots", "no bot commits"),
+    ("event and sample", "deferral_no_preexisting", "no rewritten ceiling"),
+    ("event and sample", "deferral_dedup", "one repository per shared-commit group"),
+    ("event and sample", "deferral_no_reuse", "each control used once"),
+    ("event and sample", "deferral_corpus", "MCPCorpus only"),
+    ("comparison group", "deferral_censor_controls", "censor controls that later pin"),
+    ("comparison group", "deferral_unmatched", "controls not recently active"),
+    ("comparison group", "deferral_all_v1", "any v1 repository"),
+)
+# The paper's selection, in the paper's order and without group headings;
+# every row is in FOREST_ROWS, drawn in full for the artifact.
+# Line breaks fall between phrases, so the larger type stays near column width.
+FOREST_PAPER_ROWS: tuple[tuple[str | None, str, str], ...] = (
+    (None, "deferral", "primary (exposed)"),
+    (None, "deferral_landmark", "landmark at day 1\n(both groups)"),
+    (None, "deferral_censor_controls", "censor controls\nthat later pin"),
+    (None, "deferral_unmatched", "controls not\nrecently active"),
+    (None, "deferral_all_v1", "any v1 repository"),
+    (None, "deferral_dedup", "one repository per\nshared-commit group"),
+    (None, "deferral_corpus", "MCPCorpus only"),
+)
+
+
+def deferral_forest(
+    measurement: Mapping[str, Any],
+    out: Path,
+    rows_spec: Sequence[tuple[str | None, str, str]] = FOREST_ROWS,
+    font: float = 7.0,
+) -> Path:
+    """Gap at day 30 (pinned minus controls) with its clustered 95% interval, per
+    analysis, grouped by what each variant tests, with zero marked.
+
+    The same numbers as the sensitivity table, drawn so that a reader sees at
+    once which intervals cross zero. Beside each gap are the two shares it is
+    the difference of, so a reader can tell which group moved; an analysis
+    with fewer than 100 pinned repositories carries its size in its label.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows: list[tuple[str, float, float, float, float, float] | str] = []
+    heading: str | None = None
+    for group, key, label in rows_spec:
+        block = measurement.get(key) or {}
+        clustered = block.get("clustered_30") or {}
+        gap = clustered.get("gap")
+        if not gap:
+            continue
+        if group != heading and group is not None:
+            rows.append(group)
+        heading = group
+        n_pinned = int((block.get("pinned") or {}).get("n") or 0)
+        if 0 < n_pinned < 100:
+            label = (
+                f"{label}\n(n = {n_pinned})"
+                if "\n" in "".join(spec[2] for spec in rows_spec)
+                else f"{label} (n = {n_pinned})"
+            )
+        rows.append(
+            (
+                label,
+                float(gap["pct"]),
+                float(gap["ci_low"]),
+                float(gap["ci_high"]),
+                float(clustered["pinned"]["pct"]),
+                float(clustered["controls"]["pct"]),
+            )
+        )
+    if not rows:
+        raise ValueError("no deferral analyses with intervals to plot")
+    x_min, x_max = -15.0, 25.0
+    # Drawn wider than a column and scaled down to fit it, so the type is set
+    # larger than _style's to land near the other figures' size on the page.
+    small = font - 0.5
+    style = {**_style(), "xtick.labelsize": font, "ytick.labelsize": font, "axes.labelsize": font}
+    row_height = 0.17 if font <= 7 else 0.36
+    with plt.rc_context(style):
+        width = 1.05 if font <= 7 else 1.25
+        fig, ax = plt.subplots(figsize=(width, row_height * len(rows) + 0.45))
+        labels: list[str] = []
+        for i, row in enumerate(rows):
+            y = len(rows) - 1 - i
+            if isinstance(row, str):
+                labels.append(row)
+                continue
+            label, pct, low, high, pinned_pct, control_pct = row
+            labels.append(label)
+            primary = label.startswith("primary")
+            color = PALETTE[4] if primary else PALETTE[0]
+            # Clip to the axis, with an arrow where an interval runs past it.
+            lo, hi = max(low, x_min), min(high, x_max)
+            ax.plot([lo, hi], [y, y], color=color, linewidth=1.1, solid_capstyle="butt")
+            for end, edge, marker in ((low, x_min, "<"), (high, x_max, ">")):
+                if (end < edge) if marker == "<" else (end > edge):
+                    ax.plot(edge, y, marker=marker, markersize=3.5, color=color)
+            ax.plot(pct, y, marker="D" if primary else "o", markersize=3.8, color=color)
+            # Number columns at fixed offsets from the axis, in points, so
+            # they cannot collide whatever the plot's width.
+            for offset, text in (
+                (5, f"{pinned_pct:.1f} vs {control_pct:.1f}"),
+                (round(54 * font / 7), f"{pct:.1f} [{low:.1f}, {high:.1f}]".replace("-", "\u2212")),
+            ):
+                ax.annotate(
+                    text,
+                    xy=(1, y),
+                    xycoords=("axes fraction", "data"),
+                    xytext=(offset, 0),
+                    textcoords="offset points",
+                    ha="left",
+                    va="center",
+                    fontsize=small,
+                    color=INK,
+                    annotation_clip=False,
+                )
+        # Column headings over the numbers, above the top row.
+        for offset, text in ((5, "shares (%)"), (round(54 * font / 7), "gap [95% CI]")):
+            ax.annotate(
+                text,
+                xy=(1, len(rows) - 0.4),
+                xycoords=("axes fraction", "data"),
+                xytext=(offset, 3),
+                textcoords="offset points",
+                ha="left",
+                va="bottom",
+                fontsize=small,
+                color=MUTED,
+                style="italic",
+                annotation_clip=False,
+            )
+        ax.set_xlim(x_min, x_max)
+        ax.axvline(0, color=MUTED, linestyle="--", linewidth=0.7)
+        ax.set_yticks(range(len(rows)))
+        ax.set_yticklabels(list(reversed(labels)))
+        for tick in ax.get_yticklabels():
+            tick.set_linespacing(0.95)
+        for tick, row in zip(ax.get_yticklabels(), reversed(rows), strict=True):
+            if isinstance(row, str):
+                tick.set_fontstyle("italic")
+                tick.set_color(MUTED)
+        ax.tick_params(axis="y", length=0)
+        ax.set_ylim(-0.6, len(rows) - 0.4)
+        ax.set_xticks([-10, 0, 10, 20])
+        ax.set_xlabel("gap at day 30 (points)")
+        ax.grid(axis="y", visible=False)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out, bbox_inches="tight")
+        plt.close(fig)
+    log.info("wrote %s", out)
+    return out
+
+
 def deferral_curves(deferral: Mapping[str, Any], out: Path) -> Path:
     """Cumulative share moving to Python v2 after a deferring ceiling, against
     date-matched v1 controls, with numbers at risk beneath the axis.
@@ -567,7 +732,7 @@ def deferral_curves(deferral: Mapping[str, Any], out: Path) -> Path:
 
     cohorts = (
         ("pinned", "pinned", PALETTE[4], "--"),
-        ("controls", "matched v1 control entries", PALETTE[0], "-"),
+        ("controls", "matched control entries", PALETTE[0], "-"),
     )
     with plt.rc_context(_style()):
         fig, ax = plt.subplots(figsize=(COLUMN_WIDTH_IN, 1.75))
@@ -670,6 +835,13 @@ def build_all(
         extra.append(protocol_support(protocol, out_dir / "protocol-support.pdf"))
     if measurement and measurement.get("deferral"):
         extra.append(deferral_curves(measurement["deferral"], out_dir / "deferral.pdf"))
+        # The paper's selection at a larger size, and every variant for the artifact.
+        extra.append(
+            deferral_forest(
+                measurement, out_dir / "deferral-forest.pdf", FOREST_PAPER_ROWS, font=8.5
+            )
+        )
+        extra.append(deferral_forest(measurement, out_dir / "deferral-forest-full.pdf"))
     return [
         *extra,
         episodes_by_kind(episodes, out_dir / "episodes-by-kind.pdf"),

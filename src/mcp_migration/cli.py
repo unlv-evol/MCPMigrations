@@ -773,6 +773,7 @@ def cmd_stats(args: argparse.Namespace, paths: Paths) -> int:
         n_sample_size=loaded["n_sample_size"],
         measurement=loaded["measurement"],
         coded_pins=loaded["coded_pins"],
+        coded_pins_post=loaded["coded_pins_post"],
     )
     write_json(args.out, summary)
     log.info("wrote summary to %s", args.out)

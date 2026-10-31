@@ -7,6 +7,7 @@ must match those declared in ``paper/numbers-defaults.tex``.
 
 from __future__ import annotations
 
+import math
 import statistics
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
@@ -108,6 +109,7 @@ def summarize(
     n_sample_size: int = 0,
     measurement: Mapping[str, Any] | None = None,
     coded_pins: Mapping[str, Any] | None = None,
+    coded_pins_post: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute every statistic the manuscript cites."""
     kinds = Counter(str(e["kind"]) for e in episodes)
@@ -169,7 +171,41 @@ def summarize(
         "n_sample_size": n_sample_size,
         "measurement": dict(measurement or {}),
         "coded_pins": dict(coded_pins or {}),
+        "coded_pins_post": dict(coded_pins_post or {}),
     }
+
+
+def _signed(value: float) -> str:
+    """One decimal, with a typeset minus: gaps and their intervals cross zero."""
+    text = f"{value:.1f}"
+    return "$-$" + text[1:] if text.startswith("-") else text
+
+
+def clopper_pearson_low(successes: int, total: int, alpha: float = 0.05) -> float:
+    """Lower end of the two-sided exact (Clopper-Pearson) interval for a proportion.
+
+    Exact rather than Wilson because it is quoted for samples where every call
+    was right, to bound how wrong the unread ones could be.
+    """
+    if successes <= 0 or total <= 0:
+        return 0.0
+    if successes == total:
+        return float((alpha / 2) ** (1 / total))
+
+    def upper_tail(p: float) -> float:
+        """P(X >= successes) for X ~ Binomial(total, p)."""
+        return sum(
+            math.comb(total, k) * p**k * (1 - p) ** (total - k) for k in range(successes, total + 1)
+        )
+
+    low, high = 0.0, successes / total
+    for _ in range(60):
+        mid = (low + high) / 2
+        if upper_tail(mid) < alpha / 2:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2
 
 
 def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
@@ -191,6 +227,7 @@ def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
 
     for block, suffix in (
         ("deferral", ""),
+        ("deferral_all_v1", "AllVOne"),
         ("deferral_corpus", "Corpus"),
         ("deferral_agent", "Agent"),
         ("deferral_no_agent", "NoAgent"),
@@ -198,6 +235,11 @@ def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
         ("deferral_unmatched", "Unmatched"),
         ("deferral_censor_controls", "CensorControls"),
         ("deferral_no_reuse", "NoReuse"),
+        ("deferral_code_only", "CodeOnly"),
+        ("deferral_no_bots", "NoBots"),
+        ("deferral_landmark", "Landmark"),
+        ("deferral_no_preexisting", "NoPreExisting"),
+        ("deferral_dedup", "Dedup"),
     ):
         d = m.get(block) or {}
         km("DefPinned" + suffix, d.get("pinned"))
@@ -205,16 +247,76 @@ def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
         # Pinned minus controls at day 30, in percentage points, per analysis.
         if f"pctDefPinned{suffix}" in out and f"pctDefUnpinned{suffix}" in out:
             gap = float(out[f"pctDefPinned{suffix}"]) - float(out[f"pctDefUnpinned{suffix}"])
-            out[f"pctDefGap{suffix}"] = f"{gap:.1f}"
-    scopes = (m.get("deferral") or {}).get("scopes") or {}
+            out[f"pctDefGap{suffix}"] = _signed(gap)
+        # Repository-clustered intervals for every analysis that has them.
+        for key, word in (("pinned", "Pinned"), ("controls", "Controls"), ("gap", "Gap")):
+            entry = (d.get("clustered_30") or {}).get(key)
+            if entry:
+                out[f"pctClust{word}{suffix}"] = _signed(entry["pct"])
+                out[f"pctClust{word}{suffix}Low"] = _signed(entry["ci_low"])
+                out[f"pctClust{word}{suffix}High"] = _signed(entry["ci_high"])
+    # Every post-release ceiling and its scope come from the comparison not
+    # restricted to exposed repositories; the primary drops the unexposed.
+    all_v1 = m.get("deferral_all_v1") or m.get("deferral") or {}
+    scopes = all_v1.get("scopes") or {}
     if scopes:
         out["nCeilCommits"] = _fmt(sum(int(v) for v in scopes.values()))
         out["nCeilSameCommit"] = _fmt(int(scopes.get("v2_same_commit", 0)))
         out["nCeilAlready"] = _fmt(int(scopes.get("v2_already_present", 0)))
         out["nCeilDeferral"] = _fmt(int(scopes.get("deferral", 0)))
+    primary_scopes = (m.get("deferral") or {}).get("scopes") or {}
+    if "not_exposed" in primary_scopes:
+        out["nCeilNotExposed"] = _fmt(int(primary_scopes["not_exposed"]))
     same_day = (m.get("deferral_same_day_excluded") or {}).get("scopes") or {}
     if same_day:
         out["nCeilSameDayVTwo"] = _fmt(int(same_day.get("same_day_v2", 0)))
+    crossing = (m.get("deferral") or {}).get("crossing_day")
+    if crossing is not None:
+        out["nCurveCross"] = _fmt(int(crossing))
+    landmark = (m.get("deferral_landmark") or {}).get("described") or {}
+    for key, macro in (
+        ("landmark_dropped_pinned", "nLandmarkPinned"),
+        ("landmark_dropped_controls", "nLandmarkControls"),
+    ):
+        if key in landmark:
+            out[macro] = _fmt(int(landmark[key]))
+    copies = m.get("copies") or {}
+    if copies:
+        out["nCopyGroups"] = _fmt(int(copies["groups"]))
+        out["nCopyRepos"] = _fmt(int(copies["repositories"]))
+    # Ignoring bots can let a later human ceiling take a bot's place, so the
+    # repositories removed are not the bot pinning commits.
+    no_bots = (m.get("deferral_no_bots") or {}).get("pinned") or {}
+    primary_pinned = (m.get("deferral") or {}).get("pinned") or {}
+    if no_bots.get("n") is not None and primary_pinned.get("n") is not None:
+        out["nPinBotRemoved"] = _fmt(int(primary_pinned["n"]) - int(no_bots["n"]))
+    # How events were detected and who wrote the commits, in the primary.
+    described = (m.get("deferral") or {}).get("described") or {}
+    for key, macro in (
+        ("events_code", "nEventsCodeLevel"),
+        ("events_constraint_only", "nEventsConstraintOnly"),
+        ("events_bot", "nEventsBot"),
+        ("pin_bot", "nPinBot"),
+    ):
+        if key in described:
+            out[macro] = _fmt(int(described[key]))
+    # Exposure and scope over every deferring ceiling.
+    described_all = all_v1.get("described") or {}
+    for key, macro in (
+        ("pre_existing_ceiling", "nPreExistingCeiling"),
+        ("later_deferral_lost", "nLaterDeferralLost"),
+    ):
+        if key in described_all:
+            out[macro] = _fmt(int(described_all[key]))
+    if described_all.get("pinned_fastmcp") is not None and scopes.get("deferral"):
+        out["pctPinnedFastmcp"] = (
+            f"{100 * int(described_all['pinned_fastmcp']) / int(scopes['deferral']):.1f}"
+        )
+    entries_all = (all_v1.get("matching") or {}).get("control_entries")
+    if described_all.get("control_fastmcp") is not None and entries_all:
+        out["pctControlsFastmcpAll"] = (
+            f"{100 * int(described_all['control_fastmcp']) / int(entries_all):.1f}"
+        )
     if (m.get("deferral") or {}).get("controls_per_pin"):
         out["nControlsPerPin"] = _fmt(int(m["deferral"]["controls_per_pin"]))
     matching = (m.get("deferral") or {}).get("matching") or {}
@@ -231,22 +333,26 @@ def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
     for key, macro in (
         ("prior_signal_commits_median_pinned", "nPriorPinned"),
         ("prior_signal_commits_median_controls", "nPriorControls"),
+        ("stars_median_pinned", "nStarsPinned"),
+        ("stars_median_controls", "nStarsControls"),
+        ("age_days_median_pinned", "nAgePinned"),
+        ("age_days_median_controls", "nAgeControls"),
     ):
         if matching.get(key) is not None:
             out[macro] = f"{float(matching[key]):g}"
     clustered = (m.get("deferral") or {}).get("clustered_30") or {}
-    for key, word in (("pinned", "Pinned"), ("controls", "Controls"), ("gap", "Gap")):
-        entry = clustered.get(key)
-        if entry:
-            out[f"pctClust{word}"] = f"{entry['pct']:.1f}"
-            out[f"pctClust{word}Low"] = f"{entry['ci_low']:.1f}"
-            out[f"pctClust{word}High"] = f"{entry['ci_high']:.1f}"
     if clustered.get("repositories"):
         out["nClustRepos"] = _fmt(int(clustered["repositories"]["pct"]))
     flow = m.get("cohort_flow") or {}
     if flow.get("pinned"):
         out["nFlowPinned"] = _fmt(int(flow["pinned"]))
         out["nFlowInCohort"] = _fmt(int(flow["pinned_in_release_cohort"]))
+    for key, macro in (
+        ("ts_moved_scanned", "nTsMovedScanned"),
+        ("ts_app_not_in_cohort", "nTsAppNotCohort"),
+    ):
+        if flow.get(key) is not None:
+            out[macro] = _fmt(int(flow[key]))
     diff = (m.get("deferral") or {}).get("difference_30") or {}
     if diff:
         out["pctDiffThirty"] = f"{diff['pct']:.1f}"
@@ -300,6 +406,11 @@ def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
             for key, name in (("modern", "Modern"), ("features", "Features")):
                 if row.get(key) is not None:
                     out[f"n{tag}App{name}Count{suffix}"] = _fmt(int(row[key]))
+            if lang == "python" and row.get("server_import") is not None:
+                out[f"nPyAppServerImport{suffix}"] = _fmt(int(row["server_import"]))
+                out[f"nPyAppServerFeatures{suffix}"] = _fmt(int(row.get("server_features", 0)))
+                if row.get("pct_server_features") is not None:
+                    out[f"pctPyAppServerFeatures{suffix}"] = f"{row['pct_server_features']:.1f}"
             if lang == "typescript":
                 for key, name in (
                     ("legacy_only", "LegacyOnly"),
@@ -315,6 +426,11 @@ def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
                 )
         if dims.get("v2_outside_application_only") is not None and not suffix:
             out["nVTwoOutsideApp"] = _fmt(int(dims["v2_outside_application_only"]))
+            out["nAppTsClientOnly"] = _fmt(int(dims.get("typescript_client_only", 0)))
+            out["nAppNoVTwo"] = _fmt(int(dims.get("no_v2_found", 0)))
+            outside = dims.get("outside_by_language") or {}
+            for lang, tag in (("python", "Py"), ("typescript", "Ts"), ("both", "Both")):
+                out[f"nOutsideApp{tag}"] = _fmt(int(outside.get(lang, 0)))
     if (m.get("protocol_app") or {}).get("typescript_not_v2_server") is not None:
         out["nTsNotVTwoServer"] = _fmt(int(m["protocol_app"]["typescript_not_v2_server"]))
     legacy_audit = m.get("legacy_audit") or {}
@@ -349,6 +465,34 @@ def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
     no_entry = (m.get("protocol_app") or {}).get("typescript_no_entry")
     if no_entry is not None:
         out["nTsNoEntry"] = _fmt(int(no_entry))
+    # Bounds on the legacy-only share: the unresolved repositories all
+    # legacy-only, or none of them.
+    ts_app = (m.get("protocol_app") or {}).get("typescript") or {}
+    if no_entry is not None and ts_app.get("legacy_only") is not None:
+        resolved, legacy = int(ts_app["n"]), int(ts_app["legacy_only"])
+        out["pctTsLegacyAllUnresolved"] = (
+            f"{100 * (legacy + int(no_entry)) / (resolved + int(no_entry)):.1f}"
+        )
+        out["pctTsLegacyNoUnresolved"] = f"{100 * legacy / (resolved + int(no_entry)):.1f}"
+    # How low the precision of new-revision calls could be, from the held-out
+    # sample: the reading of every negative says nothing about the positives.
+    modern = ((m.get("holdout") or {}).get("by_field") or {}).get("modern") or {}
+    if modern.get("positive"):
+        positive, correct = int(modern["positive"]), int(modern["positive_agreed"])
+        out["nHoldModernPos"] = _fmt(positive)
+        out["nHoldModernPosAgreed"] = _fmt(correct)
+        low = clopper_pearson_low(correct, positive)
+        out["pctHoldModernLow"] = f"{100 * low:.1f}"
+        # The legacy-only share if positives were only that precise.
+        ts = (m.get("protocol_app") or {}).get("typescript") or {}
+        if ts.get("modern") is not None and ts.get("legacy_only") is not None:
+            worst = int(ts["legacy_only"]) + (1 - low) * int(ts["modern"])
+            out["pctTsLegacyPrecisionBound"] = f"{100 * worst / int(ts['n']):.1f}"
+    corpus_ts = (m.get("protocol_app_corpus") or {}).get("typescript") or {}
+    if corpus_ts.get("n") and corpus_ts.get("modern") is not None:
+        low, high = wilson_interval(int(corpus_ts["modern"]), int(corpus_ts["n"]))
+        out["pctTsAppModernCorpusLow"] = f"{100 * low:.1f}"
+        out["pctTsAppModernCorpusHigh"] = f"{100 * high:.1f}"
     hist = m.get("history_validation") or {}
     if hist:
         out["nHistRepos"] = _fmt(int(hist["repos"]))
@@ -375,6 +519,10 @@ def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
         ("pin_repair", "nCeilRepair"),
         ("move_lift", "nCeilLift"),
         ("move_dual", "nCeilDual"),
+        ("later", "nCeilLater"),
+        ("later_lift", "nCeilLaterLift"),
+        ("later_dual", "nCeilLaterDual"),
+        ("later_rename", "nCeilLaterRename"),
     ):
         if pairs:
             out[macro] = _fmt(int(pairs.get(key, 0)))
@@ -389,6 +537,13 @@ def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
             if lang == "python":
                 keys += ["deferred", "ceiling_any", "moved_only", "deferred_only"]
                 keys += ["both", "neither"]
+                if row.get("moved_by_censor") is not None:
+                    keys += ["moved_by_censor", "deferred_by_censor"]
+                if row.get("neither") and row.get("neither_active") is not None:
+                    out[f"nRespPyNeitherActive{suffix}"] = _fmt(int(row["neither_active"]))
+                    out[f"pctRespPyNeitherActive{suffix}"] = (
+                        f"{100 * int(row['neither_active']) / int(row['neither']):.1f}"
+                    )
             out[f"nResp{tag}OnVOne{suffix}"] = _fmt(total)
             for key in keys:
                 word = "".join(part.capitalize() for part in key.split("_"))
@@ -401,10 +556,13 @@ def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
         out["nPinBreakage"] = _fmt(int(wording.get("breakage", 0)))
         out["pctPinBreakage"] = f"{100 * int(wording.get('breakage', 0)) / int(wording['n']):.1f}"
         out["nPinTemporary"] = _fmt(int(wording.get("temporary", 0)))
+        out["pctPinTemporary"] = f"{100 * int(wording.get('temporary', 0)) / int(wording['n']):.1f}"
         check = wording.get("check") or {}
         if check.get("n"):
             out["nPinCheck"] = _fmt(int(check["n"]))
             out["nPinCheckAgree"] = _fmt(int(check["agree"]))
+        if check.get("kappa") is not None:
+            out["kappaPinCheck"] = f"{float(check['kappa']):.2f}"
     themes = m.get("issue_themes") or {}
     if themes.get("n"):
         out["nIssuesSampled"] = _fmt(int(themes["sampled"]))
@@ -421,6 +579,20 @@ def _measurement_macros(m: Mapping[str, Any]) -> dict[str, str]:
     if feature.get("n"):
         out["nFeatCheck"] = _fmt(int(feature["n"]))
         out["nFeatCheckTrue"] = _fmt(int(feature["true"]))
+        # The shares scaled by the pooled precision of the sampled positives:
+        # rough point estimates beside the upper bounds the paper reports.
+        precision = int(feature["true"]) / int(feature["n"])
+        low, high = wilson_interval(int(feature["true"]), int(feature["n"]))
+        out["pctFeatCheckLow"] = f"{100 * low:.1f}"
+        out["pctFeatCheckHigh"] = f"{100 * high:.1f}"
+        for lang, tag in (("python", "Py"), ("typescript", "Ts")):
+            row = (m.get("protocol_app") or {}).get(lang) or {}
+            # Python over servers, as TypeScript is.
+            share = row.get("pct_server_features", row.get("pct_features"))
+            if share is not None:
+                out[f"pct{tag}AppFeaturesAdj"] = f"{precision * float(share):.1f}"
+                out[f"pct{tag}AppFeaturesAdjLow"] = f"{low * float(share):.1f}"
+                out[f"pct{tag}AppFeaturesAdjHigh"] = f"{high * float(share):.1f}"
     vignette = m.get("sampling_vignette") or {}
     if vignette.get("n"):
         out["nSampVignette"] = _fmt(int(vignette["n"]))
@@ -708,7 +880,6 @@ def to_latex(summary: Mapping[str, Any]) -> str:
         if entry.get("median_lag_adopters") is not None:
             macros["lagMedian" + suffix] = _fmt(float(entry["median_lag_adopters"]))
             macros["lagMean" + suffix] = f"{float(entry['mean_lag_adopters']):.0f}"
-    macros.update(_measurement_macros(summary.get("measurement") or {}))
     # Drawn, as against coded: nSampled is the count actually labeled.
     for macro, key in (("nSearchQueries", "n_search_queries"), ("nSampleSize", "n_sample_size")):
         if summary.get(key):
@@ -753,6 +924,17 @@ def to_latex(summary: Mapping[str, Any]) -> str:
         macros["nPinCodedRepair"] = _fmt(sum(int(triggers.get(t, 0)) for t in REPAIR_TRIGGERS))
         macros["nPinCodedProactive"] = _fmt(triggers.get("proactive", 0))
         macros["nPinCodedUnknown"] = _fmt(triggers.get("unknown", 0))
+    # The same, for ceilings added after the release: the population the
+    # deferral analysis studies. Earlier caps were written before v2 existed.
+    post = summary.get("coded_pins_post") or {}
+    if post.get("n"):
+        from mcp_migration.report.labels import REPAIR_TRIGGERS
+
+        triggers = post.get("trigger") or {}
+        macros["nPinCodedPost"] = _fmt(post["n"])
+        macros["nPinCodedPostRepair"] = _fmt(sum(int(triggers.get(t, 0)) for t in REPAIR_TRIGGERS))
+        macros["nPinCodedPostProactive"] = _fmt(triggers.get("proactive", 0))
+        macros["nPinCodedPostUnknown"] = _fmt(triggers.get("unknown", 0))
     issues = qual.get("issues") or {}
     if issues.get("n"):
         macros["nIssuesCoded"] = _fmt(issues["n"])
@@ -763,6 +945,11 @@ def to_latex(summary: Mapping[str, Any]) -> str:
             ("fresh_install", "pctIssueInstall"),
         ):
             macros[macro] = _pct(int(issues.get(key, 0)), int(issues["n"]))
+
+    # Last, so the measurement wins where an older count shares a macro name:
+    # pctPinBreakage and nPinTemporary describe the deferring ceilings there,
+    # and only every pin commit in the qualitative pass.
+    macros.update(_measurement_macros(summary.get("measurement") or {}))
 
     header = (
         "% Generated by `mcp-migration stats`. Do not edit.\n"
@@ -809,10 +996,17 @@ def load_all(paths: Any) -> dict[str, Any]:
     from mcp_migration.report.labels import coded_profile
     from mcp_migration.report.labels import read_sheet as read_sheet_rows
     from mcp_migration.report.lag import censor_date, corpus_seeds, load_lag
-    from mcp_migration.report.measurement import load_measurement
+    from mcp_migration.report.measurement import RELEASE, load_measurement
     from mcp_migration.storage import read_json, read_jsonl, read_lines
 
-    metadata = list(read_jsonl(paths.repo_meta)) if paths.repo_meta.exists() else []
+    # One record per repository: seed slugs that resolve to the same repository
+    # (renames, transfers, case) and re-fetches leave several records for it.
+    metadata = list(
+        {
+            str(m["repo"]): m
+            for m in (read_jsonl(paths.repo_meta) if paths.repo_meta.exists() else [])
+        }.values()
+    )
     exclusions: Counter[str] = Counter()
     for meta in metadata:
         if (reason := exclusion_reason(meta, Criteria())) is not None:
@@ -858,6 +1052,11 @@ def load_all(paths: Any) -> dict[str, Any]:
         "coded_pins": (
             coded_profile(read_sheet_rows(adjudicated), "pin_below_2")
             if (adjudicated := paths.labeling_round(1) / "adjudicated.csv").exists()
+            else {}
+        ),
+        "coded_pins_post": (
+            coded_profile(read_sheet_rows(adjudicated), "pin_below_2", since=RELEASE.isoformat())
+            if adjudicated.exists()
             else {}
         ),
         "lag_repos": sum(

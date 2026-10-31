@@ -1,18 +1,12 @@
-# Anonymised for now. Before release: replace the authors with real names (and
-# ORCIDs), and add repository-code and a DOI.
+# Anonymised for now.
 cff-version: 1.2.0
 message: >-
   If you use this software or data, please cite it using these metadata.
 type: software
 title: >-
-  MCP migrations: Model Context Protocol projects across a breaking protocol
-  revision
+  MCP migrations: Model Context Protocol projects across a breaking protocol revision
 abstract: >-
-  Pipeline and data for a study of MCP (Model Context Protocol) servers on
-  GitHub responding to the 2026-07-28 protocol revision and the v2 SDKs:
-  migration episodes mined from 32,939 repositories, LLM-assisted and
-  human-verified labeling samples, coded developer text, and scripts that
-  regenerate every statistic and figure.
+  Pipeline and data for a study of MCP (Model Context Protocol servers on GitHub responding to the 2026-07-28 protocol revision and the v2 SDKs: migration episodes mined from 32,939 repositories, LLM-assisted and human-verified labeling samples, coded developer text, and scripts that regenerate every statistic and figure.
 authors:
   - name: Anonymous authors
 version: 0.1.0
@@ -26,4 +20,3 @@ keywords:
   - breaking changes
   - software evolution
   - mining software repositories
-  - technical lag
