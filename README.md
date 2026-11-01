@@ -17,19 +17,21 @@ released data by one script, and checked against the expected outputs.
 | Repositories mined | 32,939 |
 | Commits with an SDK, constraint or protocol signal | 292,203 |
 | v2 repositories re-scanned at the application level | 4,577 |
-| Labeled episodes (LLM pre-labels, verified by two coders) | 520 in round 1; round 2 in progress |
+| Labeled episodes (LLM pre-labels, verified by two coders) | 520 in round 1; 176 in round 2 + 60 blind episodes (Human only labeling) |
 | Snapshot | mined 15–29 September 2026; re-scanned 14 October 2026 |
 
 ## Contents
 
-- [Quick start for reviewers](#quick-start-for-reviewers)
-- [What the package contains](#what-the-package-contains)
-- [Where each result comes from](#where-each-result-comes-from)
-- [How the labels were produced](#how-the-labels-were-produced)
-- [Running the pipeline from scratch](#running-the-pipeline-from-scratch)
-- [Tests and checks](#tests-and-checks)
-- [Notes and limitations](#notes-and-limitations)
-- [Citing and license](#citing-and-license)
+- [MCP Migrations: Replication Package](#mcp-migrations-replication-package)
+  - [Contents](#contents)
+  - [Quick start for reviewers](#quick-start-for-reviewers)
+  - [What the package contains](#what-the-package-contains)
+  - [Where each result comes from](#where-each-result-comes-from)
+  - [How the labels were produced](#how-the-labels-were-produced)
+  - [Running the pipeline from scratch](#running-the-pipeline-from-scratch)
+  - [Tests and checks](#tests-and-checks)
+  - [Notes and limitations](#notes-and-limitations)
+  - [Citing and license](#citing-and-license)
 
 ## Quick start for reviewers
 
